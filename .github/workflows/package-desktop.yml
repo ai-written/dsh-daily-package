@@ -1,35 +1,32 @@
-# 方案 A：单独仓库 + 直接 checkout 上游 —— 只有这一条 workflow 会跑
+# 打包来源默认 = 上游**最新发布的 tag**（`dsh-v*`）——也就是"上游发版才打包"。
+#   想改成跟 master 最新提交：手动 Run workflow 时把 source 选成 `master`；
+#   想让定时任务也跟 master：仓库 Settings → Secrets and variables → Actions → Variables
+#   新建 `DEFAULT_SOURCE=master`（定时任务读它，不设则用 `tag`）。
 #
-# 为什么这样最干净：上游仓库里那 20 个 workflow 不会被执行（它们只是被 checkout 到工作区的文件），
-# 你不需要 fork，也就不需要每天同步、不会有 merge 冲突，GitHub 上不会出现别的 CI 噪音。
+# 用什么记录"已经打过哪个版本"：Release tag `build-<key>`
+#   - tag 模式   key = `dsh-v0.1.6-alpha.2` → Release `build-dsh-v0.1.6-alpha.2`
+#   - master 模式 key = 提交 SHA 前 12 位   → Release `build-<sha12>`
+# 每天触发时先算 key：已经有对应 Release 就跳过（十几秒结束，windows runner 不会启动）。
 #
-# 一次性准备（在本地）：
-#   1) GitHub 网页新建**空仓库**（例如 dsh-daily-package，Public 免费用标准 runner / Private 每月 2000 分钟且 Windows ×2），
-#      不要勾选 README / .gitignore。
-#   2) 把本文件放到 <新仓库>/.github/workflows/package-desktop.yml，然后：
-#        cd <新仓库>
-#        git init -b main
-#        git add -A
-#        git commit -m "ci: daily unsigned win-x64 desktop package from upstream"
-#        git remote add origin https://github.com/<你>/dsh-daily-package.git
-#        git -c http.sslBackend=openssl push -u origin main      # 你这台机器必须带 openssl 后端，否则撞 SEC_E_NO_CREDENTIALS
-#   3) Actions 页 → 启用 workflows → 选 package-desktop → Run workflow（第一次先手动跑）。
+# 注意：上游目前的 release 全是 pre-release（alpha/rc），所以这里**不过滤预发布**，
+# 否则永远没有可打包的 tag；同时不能用 `releases/latest`（它只认非 pre-release，会 404）。
 #
-# 判断"要不要重新打包"：把已构建的上游 SHA 记成一个 Release（tag = build-<sha前12位>）。
-# 每次触发先查上游 master 的 SHA，已经有对应 Release 就跳过——所以"每天触发、只在有提交时构建"。
-#
-# 产物是**未签名**的 Windows x64 安装包（正式签名需要 EV 硬件 Token，托管 runner 没有 USB Token）：
-# 没有 app-update.yml（应用内不会自动更新），拷到别的机器可能需要 Unblock-File。
-# macOS 需要 Apple 开发者凭据，这里不做。
+# 产物是**未签名**的 Windows x64 安装包（正式签名要 EV 硬件 Token，托管 runner 没有 USB Token）：
+# 没有 app-update.yml（应用内不会自动更新）。macOS 需要 Apple 开发者凭据，这里不做。
 name: package-desktop
 
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: 忽略"已构建过"的判断，强制重新打包
+        description: 忽略"已打过包"的判断，强制重新打包
         type: boolean
         default: false
+      source:
+        description: 打包来源
+        type: choice
+        options: [tag, master]
+        default: tag
   schedule:
     - cron: '0 18 * * *' # UTC 18:00 = 北京 02:00
 
@@ -42,42 +39,68 @@ concurrency:
 
 jobs:
   upstream:
-    name: resolve upstream commit
+    name: resolve upstream release
     runs-on: ubuntu-latest
     outputs:
-      sha: ${{ steps.check.outputs.sha }}
-      short: ${{ steps.check.outputs.short }}
+      ref: ${{ steps.check.outputs.ref }}
+      key: ${{ steps.check.outputs.key }}
       version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.check.outputs.sha }}
+      mode: ${{ steps.check.outputs.mode }}
       build: ${{ steps.check.outputs.build }}
     steps:
       - id: check
-        name: 查上游 master 的 SHA / 版本，并看这个 SHA 是否已经打过包
+        name: 解析上游 tag / 提交，并判断是否已经打过包
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_INPUT: ${{ inputs.source }}
+          DEFAULT_SOURCE: ${{ vars.DEFAULT_SOURCE || 'tag' }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          sha=$(gh api repos/deepseek-ai/deepseek-harness/commits/master --jq .sha)
-          short=${sha:0:12}
-          version=$(gh api "repos/deepseek-ai/deepseek-harness/contents/package.json?ref=$sha" --jq .content \
+          API=repos/deepseek-ai/deepseek-harness
+          mode="${SRC_INPUT:-$DEFAULT_SOURCE}"
+
+          if [ "$mode" = "master" ]; then
+            ref=master
+            sha=$(gh api "$API/commits/master" --jq .sha)
+            key=${sha:0:12}
+          else
+            mode=tag
+            # 最新一个已发布、且 tag 以 dsh-v 开头的 release（上游还有 vendor 等其它 tag 家族）
+            ref=$(gh api "$API/releases?per_page=50" \
+              --jq '[.[] | select(.draft == false) | .tag_name | select(startswith("dsh-v"))][0]')
+            if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+              echo "上游没有 dsh-v* 的发布 tag，放弃"; exit 1
+            fi
+            sha=$(gh api "$API/commits/$ref" --jq .sha)
+            key=$ref
+          fi
+
+          version=$(gh api "$API/contents/package.json?ref=$sha" --jq .content \
             | base64 -d | jq -r .version)
-          echo "上游 master = $sha (dsh $version)"
-          if gh release view "build-$short" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "模式=$mode  ref=$ref  sha=$sha  dsh=$version  key=$key"
+
+          if gh release view "build-$key" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             built=true
           else
             built=false
           fi
-          echo "已构建过 build-$short ? $built"
+          echo "已打过包 build-$key ? $built"
+
           if [ "$built" = "true" ] && [ "${FORCE:-false}" != "true" ]; then
-            echo "→ 这个提交已经打过包，跳过构建"
+            echo "→ 这个版本已经打过包，跳过构建"
             state=false
           else
             state=true
           fi
+
           {
-            echo "sha=$sha"
-            echo "short=$short"
+            echo "ref=$ref"
+            echo "key=$key"
             echo "version=$version"
+            echo "sha=$sha"
+            echo "mode=$mode"
             echo "build=$state"
           } >> "$GITHUB_OUTPUT"
 
@@ -88,11 +111,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 180
     steps:
-      # 直接拉上游代码（不是你的仓库）：upstream 的 workflow 只是普通文件，不会被执行
+      # 直接拉上游代码（不是本仓库）：上游自带的那 20 个 workflow 只是普通文件，不会被执行
       - uses: actions/checkout@v4
         with:
           repository: deepseek-ai/deepseek-harness
-          ref: ${{ needs.upstream.outputs.sha }} # 若 checkout 报找不到该 SHA，改成 master 即可
+          ref: ${{ needs.upstream.outputs.ref }} # tag 模式 = 上游 tag；master 模式 = master
           fetch-depth: 1
 
       # 实测一次完整构建 ≈5.5 GB（node_modules 2.3 GB + .desktop-build 2.8 GB），
@@ -142,7 +165,7 @@ jobs:
       - name: Upload installer (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-desktop-win-x64-${{ needs.upstream.outputs.version }}-${{ needs.upstream.outputs.short }}
+          name: dsh-desktop-win-x64-${{ needs.upstream.outputs.key }}
           if-no-files-found: error
           path: |
             apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
@@ -152,20 +175,20 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: packaging-runs-${{ needs.upstream.outputs.short }}
+          name: packaging-runs-${{ needs.upstream.outputs.key }}
           if-no-files-found: ignore
           path: apps/desktop/.desktop-build/packaging-runs/**
 
-      # 只有成功走到这里才会写下 tag → 失败的构建不会被误判成"已构建"
-      - name: Release (记录已构建的 SHA)
+      # 只有成功走到这里才会写下 tag → 失败的构建不会被误判成"已构建"，下次会重试
+      - name: Release (记录已构建的版本)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $tag = "build-${{ needs.upstream.outputs.short }}"
+          $tag = "build-${{ needs.upstream.outputs.key }}"
           $exe = (Get-ChildItem apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe |
                   Select-Object -First 1).FullName
           gh release create $tag $exe `
             --repo $env:GITHUB_REPOSITORY `
             --title "dsh ${{ needs.upstream.outputs.version }} unsigned win-x64" `
-            --notes "upstream commit ${{ needs.upstream.outputs.sha }} | 未签名构建：可能有 SmartScreen 提示，未包含自动更新配置"
+            --notes "上游 ${{ needs.upstream.outputs.mode }}: ${{ needs.upstream.outputs.ref }} (${{ needs.upstream.outputs.sha }}) | 未签名构建：可能有 SmartScreen 提示，未包含自动更新配置"
