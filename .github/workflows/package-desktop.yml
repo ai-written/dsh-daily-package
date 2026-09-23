@@ -1,12 +1,12 @@
 # 打包来源默认 = 上游**最新发布的 tag**（`dsh-v*`）——也就是"上游发版才打包"。
-#   想改成跟 master 最新提交：手动 Run workflow 时把 source 选成 `master`；
-#   想让定时任务也跟 master：仓库 Settings → Secrets and variables → Actions → Variables
-#   新建 `DEFAULT_SOURCE=master`（定时任务读它，不设则用 `tag`）。
+#   想改成跟 master 最新提交：手动 Run workflow 时把 source 选成 `master`。
+#
+# 触发方式：**只有手动**（Actions 页 → Run workflow）。定时任务已去掉，不会再自动跑。
 #
 # 用什么记录"已经打过哪个版本"：Release tag `build-<key>`
 #   - tag 模式   key = `dsh-v0.1.6-alpha.2` → Release `build-dsh-v0.1.6-alpha.2`
 #   - master 模式 key = 提交 SHA 前 12 位   → Release `build-<sha12>`
-# 每天触发时先算 key：已经有对应 Release 就跳过（十几秒结束，windows runner 不会启动）。
+# 开始打包前先算 key：已经有对应 Release 就跳过（十几秒结束，windows runner 不会启动）。
 #
 # 注意：上游目前的 release 全是 pre-release（alpha/rc），所以这里**不过滤预发布**，
 # 否则永远没有可打包的 tag；同时不能用 `releases/latest`（它只认非 pre-release，会 404）。
@@ -27,8 +27,6 @@ on:
         type: choice
         options: [tag, master]
         default: tag
-  schedule:
-    - cron: '0 18 * * *' # UTC 18:00 = 北京 02:00
 
 permissions:
   contents: write # 创建 Release 需要写权限
@@ -54,12 +52,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SRC_INPUT: ${{ inputs.source }}
-          DEFAULT_SOURCE: ${{ vars.DEFAULT_SOURCE || 'tag' }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
           API=repos/deepseek-ai/deepseek-harness
-          mode="${SRC_INPUT:-$DEFAULT_SOURCE}"
+          mode="${SRC_INPUT:-tag}"
 
           if [ "$mode" = "master" ]; then
             ref=master
